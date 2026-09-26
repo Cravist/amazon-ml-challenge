@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data directories (TSVs go here)
+data/*
+!data/.gitkeep
+!data/dataset/.gitkeep
+!data/train/.gitkeep
+!data/test/.gitkeep
+
+# Trained model artifacts
+models/*
+!models/.gitkeep
+
+# Pipeline outputs (candidate pairs, matching results)
+output/*
+!output/.gitkeep
+!output/candidate_pairs.tsv.example
+!output/matching_results.tsv.example
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# Jupyter / IDE files
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
