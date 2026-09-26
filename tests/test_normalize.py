@@ -190,3 +190,42 @@ def test_tokenize():
 
     tokens3 = tokenize(None)
     assert tokens3 == []
+
+
+def test_junk_prefix_and_symbol_stripping():
+    """Verify leading/trailing junk punctuation and symbol runs are stripped cleanly."""
+    name1 = "-- Holloway Peak Inc Seafood"
+    name2 = "<< Team Ecole"
+    name3 = ">> Acme Corp **"
+    addr1 = "-- 105 ELM ST, MORGANTON, NC --"
+
+    assert normalize_name(name1) == "holloway peak incorporated seafood"
+    assert normalize_name(name2) == "team ecole"
+    assert normalize_name(name3) == "acme corporation"
+    assert normalize_address(addr1) == "105 elm street morganton nc"
+
+
+def test_null_and_blank_address_placeholders():
+    """Verify <blank>, <NULL>, null, and nan placeholders normalize to empty strings."""
+    placeholders = ["<blank>", "<BLANK>", "<NULL>", "<null>", "null", "nan", "<nan>", "None", ""]
+    for ph in placeholders:
+        assert normalize_address(ph) == ""
+        assert normalize_name(ph) == ""
+
+
+def test_devanagari_and_indic_scripts():
+    """Verify Devanagari and Indic script names/addresses are preserved without mangling."""
+    # Devanagari business names from dataset
+    name1 = "राम मार्केटिंग प्राइवेट लिमिटेड"
+    name2 = "आदित्य प्रॉपर्टीज एलएलपी"
+    # Kannada address fragment
+    addr1 = "ಕರ್ನಾಟಕ, Bijapur"
+
+    norm_name1 = normalize_name(name1)
+    norm_name2 = normalize_name(name2)
+    norm_addr1 = normalize_address(addr1)
+
+    assert norm_name1 == "राम मार्केटिंग प्राइवेट लिमिटेड"
+    assert norm_name2 == "आदित्य प्रॉपर्टीज एलएलपी"
+    assert norm_addr1 == "ಕರ್ನಾಟಕ bijapur"
+

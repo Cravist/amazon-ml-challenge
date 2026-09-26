@@ -183,21 +183,63 @@ ADDRESS_ABBREVIATIONS: dict[str, str] = {
 
 
 # ==============================================================================
-# Core Normalization Functions
+# Null & Placeholder Strings
 # ==============================================================================
+NULL_PLACEHOLDERS: set[str] = {
+    "",
+    "null",
+    "<null>",
+    "nan",
+    "<nan>",
+    "none",
+    "<none>",
+    "blank",
+    "<blank>",
+    "n/a",
+    "na",
+    "undefined",
+}
+
+
+def strip_outer_junk(text: str) -> str:
+    """
+    Strip leading and trailing junk punctuation and symbol runs (e.g. '--', '<<', '>>', '**')
+    while strictly preserving word characters across all Unicode scripts (including Indic
+    combining marks/matras like 'ी', 'ो', 'ु', etc.).
+    """
+    start = 0
+    n = len(text)
+    while start < n:
+        cat = unicodedata.category(text[start])
+        if cat[0] in ("L", "M", "N") or text[start] == "_":
+            break
+        start += 1
+
+    end = n
+    while end > start:
+        cat = unicodedata.category(text[end - 1])
+        if cat[0] in ("L", "M", "N") or text[end - 1] == "_":
+            break
+        end -= 1
+
+    return text[start:end]
+
 
 def clean_text(text: str | None, preserve_hyphens: bool = True) -> str:
     """
     Standardize raw text:
-    1. Unicode NFKD decomposition (strips combining accents/diacritics for French/Spanish/etc.)
-    2. Lowercase transformation
-    3. Ampersand expansion (& -> 'and')
-    4. Punctuation stripping (optionally preserving internal hyphens like 'wal-mart', 'saint-denis')
-    5. Whitespace collapsing
+    1. Check for null/placeholder strings ("", "<blank>", "<null>", "nan", etc.)
+    2. Unicode NFKD decomposition (strips Latin combining accents/diacritics while preserving Indic scripts)
+    3. Lowercase transformation
+    4. Strip leading and trailing junk punctuation and symbol runs (e.g. "--", "<<", ">>", "**")
+    5. Collapse dotted acronyms BEFORE general punctuation removal: S.A. -> sa, L.L.C. -> llc
+    6. Ampersand expansion (& -> 'and')
+    7. Unicode-aware punctuation stripping (preserving word characters across all scripts and internal hyphens)
+    8. Whitespace collapsing and null placeholder check
 
     Args:
         text: Raw input string or None.
-        preserve_hyphens: Whether to preserve internal hyphens flanked by alphanumeric characters.
+        preserve_hyphens: Whether to preserve internal hyphens flanked by word characters.
 
     Returns:
         Cleaned, normalized lowercase string with single whitespace separation.
@@ -205,39 +247,60 @@ def clean_text(text: str | None, preserve_hyphens: bool = True) -> str:
     if not text:
         return ""
 
-    text = str(text)
+    raw = str(text).strip()
+    if raw.lower() in NULL_PLACEHOLDERS:
+        return ""
 
-    # 1. Unicode decomposition & diacritic stripping (e.g. é -> e, ç -> c)
-    text = "".join(
-        c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)
-    )
+    # 1. Unicode NFKD decomposition:
+    # Strip Latin/European combining diacritical marks (U+0300 - U+036F)
+    # while preserving Indic combining vowel signs/marks (U+0900 - U+0DFF, etc.)
+    decomp = unicodedata.normalize("NFKD", raw)
+    text_val = "".join(c for c in decomp if not (0x0300 <= ord(c) <= 0x036F))
 
-    # 2. Lowercase
-    text = text.lower()
+    # 2. Lowercase transformation
+    text_val = text_val.lower()
 
-    # 3. Collapse dotted acronyms BEFORE general punctuation removal so they don't
+    # 3. Strip leading/trailing junk punctuation and symbol runs (e.g. "--", "<<", ">>", "**")
+    text_val = strip_outer_junk(text_val)
+
+    # 4. Collapse dotted acronyms BEFORE general punctuation removal so they don't
     #    fragment into individual letters: S.A. -> sa, L.L.C. -> llc, S.A.R.L. -> sarl
-    text = re.sub(
+    text_val = re.sub(
         r"\b[a-z](?:\.[a-z])+\.?",
         lambda m: m.group(0).replace(".", ""),
-        text,
+        text_val,
     )
 
-    # 4. Expand ampersands
-    text = re.sub(r"&", " and ", text)
+    # 5. Expand ampersands
+    text_val = re.sub(r"&", " and ", text_val)
 
-    # 5. Strip punctuation
-    if preserve_hyphens:
-        # Keep alphanumeric, whitespace, and hyphens; replace everything else with space
-        text = re.sub(r"[^\w\s-]", " ", text)
-        # Strip hyphens that are not flanked on BOTH sides by alphanumeric characters
-        # (handles leading/trailing hyphens on the whole string and isolated hyphens)
-        text = re.sub(r"(?<![a-z0-9])-|-(?![a-z0-9])", " ", text)
-    else:
-        text = re.sub(r"[^\w\s]", " ", text)
+    # 6. Unicode-aware character filtering (preserves letters L, marks M, numbers N, whitespace Z, and hyphens)
+    res: list[str] = []
+    for c in text_val:
+        cat = unicodedata.category(c)
+        if cat[0] in ("L", "M", "N") or cat[0] == "Z" or (preserve_hyphens and c == "-"):
+            res.append(c)
+        else:
+            res.append(" ")
+    s = "".join(res)
 
-    # 6. Collapse multiple whitespaces
-    return re.sub(r"\s+", " ", text).strip()
+    # 7. Preserve internal hyphens only if flanked on both sides by word characters
+    if preserve_hyphens and "-" in s:
+        chars = list(s)
+        n = len(chars)
+        for i, ch in enumerate(chars):
+            if ch == "-":
+                left_ok = (i > 0 and (unicodedata.category(chars[i - 1])[0] in ("L", "M", "N") or chars[i - 1] == "_"))
+                right_ok = (i < n - 1 and (unicodedata.category(chars[i + 1])[0] in ("L", "M", "N") or chars[i + 1] == "_"))
+                if not (left_ok and right_ok):
+                    chars[i] = " "
+        s = "".join(chars)
+
+    # 8. Collapse multiple whitespaces and final placeholder check
+    out = re.sub(r"\s+", " ", s).strip()
+    if out.lower() in NULL_PLACEHOLDERS:
+        return ""
+    return out
 
 
 def normalize_name(name: str | None) -> str:
@@ -295,12 +358,21 @@ def extract_legal_suffix(name: str | None) -> tuple[str, str | None]:
         return ("", None)
 
     raw_str = str(name).strip()
+    if raw_str.lower() in NULL_PLACEHOLDERS:
+        return ("", None)
+
+    # Strip leading/trailing junk punctuation
+    raw_str = strip_outer_junk(raw_str).strip()
+    if not raw_str:
+        return ("", None)
+
     match = LEGAL_SUFFIX_PATTERN.search(raw_str)
     if not match:
         return (raw_str, None)
 
     raw_suffix = match.group(1).strip()
     core_name = raw_str[: match.start()].rstrip(" ,.-/")
+    core_name = strip_outer_junk(core_name).strip()
 
     # If removing suffix leaves an empty core name, treat entire name as core name
     if not core_name:

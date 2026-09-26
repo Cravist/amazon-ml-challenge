@@ -47,14 +47,17 @@ MODELS_DIR: Path = PROJECT_ROOT / "models"
 DATASET_DIR: Path = DATA_DIR / "dataset"
 TRAIN_DATA_DIR: Path = DATASET_DIR / "train"
 TEST_DATA_DIR: Path = DATASET_DIR / "test"
+TRAIN_SAMPLE_DATA_DIR: Path = DATASET_DIR / "train_sample"
 
 # Standard aliases
 TRAIN_DIR: Path = TRAIN_DATA_DIR
 TEST_DIR: Path = TEST_DATA_DIR
+TRAIN_SAMPLE_DIR: Path = TRAIN_SAMPLE_DATA_DIR
 
 # Fallback flat split directories under data/
 FALLBACK_TRAIN_DATA_DIR: Path = DATA_DIR / "train"
 FALLBACK_TEST_DATA_DIR: Path = DATA_DIR / "test"
+FALLBACK_TRAIN_SAMPLE_DATA_DIR: Path = DATA_DIR / "train_sample"
 
 # Canonical Output File Paths
 CANDIDATE_PAIRS_TSV: Path = OUTPUT_DIR / "candidate_pairs.tsv"
@@ -66,26 +69,34 @@ DEFAULT_MODEL_PATH: Path = MODELS_DIR / "lgbm_entity_resolution.joblib"
 
 def get_split_dir(split: str) -> Path:
     """
-    Resolve the input directory path for a given split ('train' or 'test').
+    Resolve the input directory path for a given split ('train', 'test', or 'train_sample').
 
     Checks both `data/dataset/<split>` and `data/<split>`. If neither exists,
     returns `data/dataset/<split>`.
 
     Args:
-        split: The dataset split name ('train' or 'test').
+        split: The dataset split name ('train', 'test', or 'train_sample').
 
     Returns:
         Path: Path object pointing to the split directory.
 
     Raises:
-        ValueError: If split is not 'train' or 'test'.
+        ValueError: If split is not 'train', 'test', or 'train_sample'.
     """
     split = split.lower().strip()
-    if split not in {"train", "test"}:
-        raise ValueError(f"Invalid split '{split}'. Expected 'train' or 'test'.")
+    valid_splits = {"train", "test", "train_sample", "sample"}
+    if split not in valid_splits:
+        raise ValueError(f"Invalid split '{split}'. Expected one of {valid_splits}.")
 
-    preferred = TRAIN_DATA_DIR if split == "train" else TEST_DATA_DIR
-    fallback = FALLBACK_TRAIN_DATA_DIR if split == "train" else FALLBACK_TEST_DATA_DIR
+    if split in {"train_sample", "sample"}:
+        preferred = TRAIN_SAMPLE_DATA_DIR
+        fallback = FALLBACK_TRAIN_SAMPLE_DATA_DIR
+    elif split == "train":
+        preferred = TRAIN_DATA_DIR
+        fallback = FALLBACK_TRAIN_DATA_DIR
+    else:
+        preferred = TEST_DATA_DIR
+        fallback = FALLBACK_TEST_DATA_DIR
 
     if preferred.exists():
         return preferred
