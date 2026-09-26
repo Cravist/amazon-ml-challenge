@@ -107,48 +107,44 @@ def load_tsv_file(file_path: Path, description: str = "") -> pd.DataFrame:
     return df
 
 
-def detect_column(df: pd.DataFrame, candidates: Sequence[str], default_name: str) -> str:
+# Exact expected schemas from problem specification
+EXPECTED_SOURCE_COLUMNS: tuple[str, ...] = (
+    "entity_id",
+    "business_name",
+    "business_address",
+    "country",
+)
+
+
+def validate_source_dataframe(df: pd.DataFrame, filename: str) -> pd.DataFrame:
     """
-    Detect column name from a list of candidate strings (case-insensitive).
+    Validate that a source DataFrame contains the exact expected schema.
+
+    Expected columns: entity_id, business_name, business_address, country.
+
+    Args:
+        df: Input DataFrame loaded from TSV.
+        filename: Name of the source file for error reporting.
+
+    Returns:
+        pd.DataFrame with exact schema and cleaned string values.
+
+    Raises:
+        AssertionError: If any expected column is missing from df.
     """
-    col_map = {col.lower().strip(): col for col in df.columns}
-    for cand in candidates:
-        if cand.lower().strip() in col_map:
-            return col_map[cand.lower().strip()]
-    raise KeyError(
-        f"Could not find required column {default_name}. Candidates checked: {candidates}. "
-        f"Available columns: {list(df.columns)}"
+    missing = [col for col in EXPECTED_SOURCE_COLUMNS if col not in df.columns]
+    assert not missing, (
+        f"Schema validation error in {filename}: missing expected column(s) {missing}.\n"
+        f"Expected exact columns: {list(EXPECTED_SOURCE_COLUMNS)}\n"
+        f"Found columns: {list(df.columns)}"
     )
 
-
-def standardize_source_df(df: pd.DataFrame, source_num: int) -> pd.DataFrame:
-    """
-    Standardize source DataFrame columns to:
-    ['entity_id', 'business_name', 'business_address', 'country']
-    """
-    out = df.copy()
-    id_candidates = [
-        f"source{source_num}_entity_id",
-        f"source{source_num}_id",
-        "entity_id",
-        "id",
-        "record_id",
-    ]
-    name_candidates = ["business_name", "name", "company_name", "legal_name"]
-    addr_candidates = ["business_address", "address", "street_address", "location"]
-    country_candidates = ["country", "country_code", "nation", "geo"]
-
-    id_col = detect_column(out, id_candidates, f"source{source_num}_entity_id")
-    name_col = detect_column(out, name_candidates, "business_name")
-    addr_col = detect_column(out, addr_candidates, "business_address")
-    country_col = detect_column(out, country_candidates, "country")
-
-    out["entity_id"] = out[id_col].astype(str).str.strip()
-    out["business_name"] = out[name_col].astype(str).str.strip()
-    out["business_address"] = out[addr_col].astype(str).str.strip()
-    out["country"] = out[country_col].astype(str).str.strip().str.upper()
-
-    return out[["entity_id", "business_name", "business_address", "country"]]
+    out = df[list(EXPECTED_SOURCE_COLUMNS)].copy()
+    out["entity_id"] = out["entity_id"].astype(str).str.strip()
+    out["business_name"] = out["business_name"].astype(str).str.strip()
+    out["business_address"] = out["business_address"].astype(str).str.strip()
+    out["country"] = out["country"].astype(str).str.strip().str.upper()
+    return out
 
 
 # ==============================================================================
@@ -197,85 +193,80 @@ def analyze_row_counts_and_countries(
     return country_df
 
 
+EXPECTED_GROUND_TRUTH_COLUMNS: tuple[str, ...] = (
+    "source1_entity_id",
+    "matched_entity_ids",
+)
+
+
 def parse_ground_truth(
-    gt_df: pd.DataFrame,
+    gt_df: pd.DataFrame, filename: str = "train_ground_truth.tsv"
 ) -> tuple[pd.DataFrame, list[str]]:
     """
-    Parse train_ground_truth.tsv into a standardized pair format:
-    ['source1_entity_id', 'target_source', 'target_entity_id']
-    """
-    cols_lower = {col.lower().strip(): col for col in gt_df.columns}
+    Parse train_ground_truth.tsv using exact expected column names:
+    'source1_entity_id' and 'matched_entity_ids'.
 
-    # Case 1: Wide format with source1_entity_id, source2_entity_id, source3_entity_id
-    s1_id_col = detect_column(
-        gt_df, ["source1_entity_id", "source1_id", "s1_id"], "source1_entity_id"
+    The 'matched_entity_ids' column contains a single comma-separated string
+    of matched entity IDs prefixed with S2- or S3- (e.g., 'S2_101, S3_205').
+
+    Args:
+        gt_df: Ground truth DataFrame loaded from TSV.
+        filename: Name of the ground truth file for error reporting.
+
+    Returns:
+        Tuple of (standardized_pairs_df, list_of_all_s1_ids_in_gt),
+        where standardized_pairs_df has columns:
+        ['source1_entity_id', 'target_source', 'target_entity_id'].
+
+    Raises:
+        AssertionError: If either source1_entity_id or matched_entity_ids is missing.
+    """
+    missing = [col for col in EXPECTED_GROUND_TRUTH_COLUMNS if col not in gt_df.columns]
+    assert not missing, (
+        f"Schema validation error in {filename}: missing expected ground-truth column(s) {missing}.\n"
+        f"Expected exact columns: {list(EXPECTED_GROUND_TRUTH_COLUMNS)}\n"
+        f"Found columns: {list(gt_df.columns)}"
     )
 
-    pairs: list[dict[str, str]] = []
+    s1_vals = gt_df["source1_entity_id"].astype(str).str.strip().values
+    raw_matched_vals = gt_df["matched_entity_ids"].astype(str).str.strip().values
 
-    has_s2 = any(k in cols_lower for k in ["source2_entity_id", "source2_id", "s2_id"])
-    has_s3 = any(k in cols_lower for k in ["source3_entity_id", "source3_id", "s3_id"])
+    pairs_s1: list[str] = []
+    pairs_src: list[str] = []
+    pairs_tgt: list[str] = []
 
-    if has_s2 or has_s3:
-        s2_col = detect_column(
-            gt_df, ["source2_entity_id", "source2_id", "s2_id"], "source2_entity_id"
-        ) if has_s2 else None
-        s3_col = detect_column(
-            gt_df, ["source3_entity_id", "source3_id", "s3_id"], "source3_entity_id"
-        ) if has_s3 else None
+    for s1_val, raw_matched in zip(s1_vals, raw_matched_vals):
+        if not s1_val or not raw_matched or raw_matched.lower() in {"none", "nan", "null", ""}:
+            continue
 
-        for _, row in gt_df.iterrows():
-            s1_val = str(row[s1_id_col]).strip()
-            if not s1_val:
+        matched_items = raw_matched.split(",")
+        for item in matched_items:
+            item = item.strip()
+            if not item:
                 continue
 
-            if s2_col is not None:
-                s2_val = str(row[s2_col]).strip()
-                if s2_val and s2_val.lower() not in {"none", "nan", "null", ""}:
-                    pairs.append({
-                        "source1_entity_id": s1_val,
-                        "target_source": "source2",
-                        "target_entity_id": s2_val,
-                    })
+            # Determine source origin by S2- / S3- prefix
+            item_lower = item.lower()
+            if item_lower.startswith("s2") or "source2" in item_lower:
+                target_source = "source2"
+            elif item_lower.startswith("s3") or "source3" in item_lower:
+                target_source = "source3"
+            else:
+                target_source = "unknown"
 
-            if s3_col is not None:
-                s3_val = str(row[s3_col]).strip()
-                if s3_val and s3_val.lower() not in {"none", "nan", "null", ""}:
-                    pairs.append({
-                        "source1_entity_id": s1_val,
-                        "target_source": "source3",
-                        "target_entity_id": s3_val,
-                    })
-    else:
-        # Long format: source1_entity_id, target_entity_id, and optionally target_source
-        target_id_col = detect_column(
-            gt_df, ["target_entity_id", "target_id", "matched_entity_id", "source2_or_3_id"], "target_entity_id"
-        )
-        target_src_col = cols_lower.get("target_source") or cols_lower.get("source")
+            pairs_s1.append(s1_val)
+            pairs_src.append(target_source)
+            pairs_tgt.append(item)
 
-        for _, row in gt_df.iterrows():
-            s1_val = str(row[s1_id_col]).strip()
-            tgt_val = str(row[target_id_col]).strip()
-            if not s1_val or not tgt_val or tgt_val.lower() in {"none", "nan", "null", ""}:
-                continue
-
-            tgt_src = "unknown"
-            if target_src_col:
-                tgt_src = str(row[target_src_col]).strip().lower()
-            elif tgt_val.startswith("s2_") or "source2" in tgt_val.lower():
-                tgt_src = "source2"
-            elif tgt_val.startswith("s3_") or "source3" in tgt_val.lower():
-                tgt_src = "source3"
-
-            pairs.append({
-                "source1_entity_id": s1_val,
-                "target_source": tgt_src,
-                "target_entity_id": tgt_val,
-            })
-
-    standardized_pairs = pd.DataFrame(pairs)
-    all_s1_in_gt = gt_df[s1_id_col].dropna().astype(str).str.strip().unique().tolist()
+    standardized_pairs = pd.DataFrame({
+        "source1_entity_id": pairs_s1,
+        "target_source": pairs_src,
+        "target_entity_id": pairs_tgt,
+    })
+    all_s1_in_gt = [s for s in dict.fromkeys(s1_vals) if s]
     return standardized_pairs, all_s1_in_gt
+
+
 
 
 def analyze_match_distribution(
@@ -432,32 +423,46 @@ def sample_and_print_matched_pairs(
         tgt_src = row["target_source"]
         tgt_id = row["target_entity_id"]
 
-        s1_row = s1_idx.loc[s1_id] if s1_id in s1_idx.index else None
-        if tgt_src == "source2" and tgt_id in s2_idx.index:
-            tgt_row = s2_idx.loc[tgt_id]
-        elif tgt_src == "source3" and tgt_id in s3_idx.index:
-            tgt_row = s3_idx.loc[tgt_id]
+        if s1_id not in s1_idx.index:
+            raise KeyError(
+                f"Data integrity error: source1_entity_id '{s1_id}' in train_ground_truth.tsv "
+                f"was not found in train_source1.tsv by exact entity_id match."
+            )
+        s1_entry = s1_idx.loc[s1_id]
+        s1_row = s1_entry.iloc[0] if isinstance(s1_entry, pd.DataFrame) else s1_entry
+
+        if tgt_src == "source2":
+            if tgt_id not in s2_idx.index:
+                raise KeyError(
+                    f"Data integrity error: matched_entity_ids value '{tgt_id}' (source2) in "
+                    f"train_ground_truth.tsv was not found in train_source2.tsv by exact entity_id match."
+                )
+            tgt_entry = s2_idx.loc[tgt_id]
+            tgt_row = tgt_entry.iloc[0] if isinstance(tgt_entry, pd.DataFrame) else tgt_entry
+        elif tgt_src == "source3":
+            if tgt_id not in s3_idx.index:
+                raise KeyError(
+                    f"Data integrity error: matched_entity_ids value '{tgt_id}' (source3) in "
+                    f"train_ground_truth.tsv was not found in train_source3.tsv by exact entity_id match."
+                )
+            tgt_entry = s3_idx.loc[tgt_id]
+            tgt_row = tgt_entry.iloc[0] if isinstance(tgt_entry, pd.DataFrame) else tgt_entry
         else:
-            tgt_row = None
-
-        s1_name = s1_row["business_name"] if s1_row is not None else "(Not Found)"
-        s1_addr = s1_row["business_address"] if s1_row is not None else "(Not Found)"
-        s1_country = s1_row["country"] if s1_row is not None else ""
-
-        tgt_name = tgt_row["business_name"] if tgt_row is not None else "(Not Found)"
-        tgt_addr = tgt_row["business_address"] if tgt_row is not None else "(Not Found)"
-        tgt_country = tgt_row["country"] if tgt_row is not None else ""
+            raise ValueError(
+                f"Unrecognized target source '{tgt_src}' for matched entity ID '{tgt_id}'. "
+                f"Expected entity ID to begin with S2- or S3- prefix."
+            )
 
         records.append({
             "pair_num": i + 1,
             "s1_id": s1_id,
             "target_source": tgt_src,
             "target_id": tgt_id,
-            "s1_name": s1_name,
-            "target_name": tgt_name,
-            "s1_addr": s1_addr,
-            "target_addr": tgt_addr,
-            "country": s1_country or tgt_country,
+            "s1_name": str(s1_row["business_name"]),
+            "target_name": str(tgt_row["business_name"]),
+            "s1_addr": str(s1_row["business_address"]),
+            "target_addr": str(tgt_row["business_address"]),
+            "country": str(s1_row["country"]) or str(tgt_row["country"]),
         })
 
     # Pretty print side by side
@@ -776,11 +781,11 @@ def main() -> None:
     df_s3_raw = load_tsv_file(s3_file, "train_source3.tsv")
     df_gt_raw = load_tsv_file(gt_file, "train_ground_truth.tsv")
 
-    # Standardize column structures
-    s1_std = standardize_source_df(df_s1_raw, 1)
-    s2_std = standardize_source_df(df_s2_raw, 2)
-    s3_std = standardize_source_df(df_s3_raw, 3)
-    gt_pairs, _ = parse_ground_truth(df_gt_raw)
+    # Validate schemas with exact column assertions
+    s1_std = validate_source_dataframe(df_s1_raw, "train_source1.tsv")
+    s2_std = validate_source_dataframe(df_s2_raw, "train_source2.tsv")
+    s3_std = validate_source_dataframe(df_s3_raw, "train_source3.tsv")
+    gt_pairs, _ = parse_ground_truth(df_gt_raw, "train_ground_truth.tsv")
 
     # Execute EDA analysis tasks
     country_df = analyze_row_counts_and_countries(s1_std, s2_std, s3_std)

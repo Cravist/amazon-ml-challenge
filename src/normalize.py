@@ -1,9 +1,18 @@
 """
-Text and address normalization utilities for entity records.
+Text and address normalization utilities for entity resolution.
 
-Provides clean-up routines for business entity attributes such as company names,
-street addresses, postal codes, and telephone numbers to improve downstream blocking
-and matching quality.
+Provides general-purpose string normalization routines for business entity records
+across international domains (US, India, France, etc.) without hardcoding country-specific
+parsing rules:
+1. normalize_name: Standardizes company names, stripping punctuation (preserving internal hyphens),
+   expanding common business abbreviations (corp <-> corporation, pvt <-> private, & <-> and),
+   and normalizing whitespace.
+2. extract_legal_suffix: Splits off trailing corporate legal designations (e.g. 'inc', 'llc',
+   'pvt ltd', 'gmbh', 'sarl') as a distinct feature tuple: (core_name, suffix_or_None).
+3. normalize_address: Cleans street addresses, standardizing abbreviations (rd <-> road,
+   st <-> street, ave <-> avenue, apt <-> apartment) while preserving landmark phrases
+   ('near', 'opposite') and internal hyphens without structured geocoding.
+4. tokenize: Simple whitespace tokenization on normalized strings for Jaccard/token-set features.
 """
 
 from __future__ import annotations
@@ -13,156 +22,406 @@ import logging
 import re
 import unicodedata
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
-import pandas as pd
+try:
+    import pandas as pd
+except ImportError:
+    pd = None  # type: ignore
 
 from src.config import RANDOM_SEED, get_split_dir, seed_everything
 
 logger = logging.getLogger(__name__)
 
-# Common legal business suffixes mapped to canonical abbreviations or empty strings
-LEGAL_SUFFIXES_REGEX: re.Pattern = re.compile(
-    r"\b(inc(orporated)?|llc|l\.l\.c\.|ltd|limited|corp(oration)?|co(mpany)?|gmbh|pvt|plc)\b",
+# ==============================================================================
+# Abbreviation Dictionaries (General-purpose for US, India, France, etc.)
+# ==============================================================================
+
+# Mapping from common business abbreviations to canonical full expansions
+NAME_ABBREVIATIONS: dict[str, str] = {
+    # Corporate / Legal forms
+    "corp": "corporation",
+    "inc": "incorporated",
+    "ltd": "limited",
+    "pvt": "private",
+    "co": "company",
+    "cie": "compagnie",
+    # Common industry terms
+    "mfg": "manufacturing",
+    "univ": "university",
+    "intl": "international",
+    "assoc": "association",
+    "assn": "association",
+    "tech": "technology",
+    "svcs": "services",
+    "svc": "service",
+    "serv": "services",
+    "dept": "department",
+    "div": "division",
+    "grp": "group",
+    "ind": "industries",
+    "inds": "industries",
+    "ent": "enterprise",
+    "mgmt": "management",
+    "comm": "commercial",
+    "natl": "national",
+    "fed": "federal",
+    "distrib": "distribution",
+    "lab": "laboratory",
+    "labs": "laboratories",
+    "sys": "systems",
+    "med": "medical",
+    "hlth": "health",
+    "pharma": "pharmaceuticals",
+}
+
+# Trailing legal suffix regex pattern (multi-word patterns evaluated first)
+LEGAL_SUFFIX_PATTERN: re.Pattern = re.compile(
+    r"(?:[\s,./-]+)"
+    r"("
+    # Multi-word suffixes
+    r"pvt\.?\s+ltd\.?|"
+    r"private\s+limited|"
+    r"pvt\.?\s+limited|"
+    r"co\.?\s+ltd\.?|"
+    r"company\s+limited|"
+    r"public\s+limited(?:\s+company)?|"
+    # Single-word suffixes (US / UK / International)
+    r"corp(?:oration)?\.?|"
+    r"inc(?:orporated)?\.?|"
+    r"l\.?l\.?c\.?|"
+    r"l\.?l\.?p\.?|"
+    r"ltd\.?|"
+    r"limited|"
+    r"pvt\.?|"
+    r"private|"
+    r"plc\.?|"
+    r"co(?:mpany)?\.?|"
+    # Germany / Continental Europe
+    r"gmbh\.?|"
+    r"ag\.?|"
+    # France / Francophone Europe
+    r"s\.?a\.?r\.?l\.?|"
+    r"s\.?a\.?s\.?u?\.?|"
+    r"s\.?a\.?|"
+    r"eurl\.?|"
+    r"sci\.?|"
+    r"snc\.?|"
+    r"cie\.?|"
+    r"compagnie|"
+    # Other common EU forms
+    r"se\.?|"
+    r"b\.?v\.?|"
+    r"n\.?v\.?|"
+    r"s\.?p\.?a\.?|"
+    r"s\.?r\.?l\.?"
+    r")\.?$",
     re.IGNORECASE,
 )
 
-# Street suffix expansions / canonicalizations
-STREET_SUFFIX_MAP: dict[str, str] = {
-    "avenue": "ave",
-    "street": "st",
-    "boulevard": "blvd",
-    "drive": "dr",
-    "road": "rd",
-    "lane": "ln",
-    "court": "ct",
-    "circle": "cir",
-    "highway": "hwy",
-    "parkway": "pkwy",
-    "suite": "ste",
-    "apartment": "apt",
+# Canonical mapping for extracted legal suffixes
+LEGAL_SUFFIX_CANONICAL: dict[str, str] = {
+    "private limited": "pvt ltd",
+    "pvt limited": "pvt ltd",
+    "pvt ltd": "pvt ltd",
+    "company limited": "co ltd",
+    "co ltd": "co ltd",
+    "public limited company": "plc",
+    "public limited": "plc",
+    "corporation": "corp",
+    "incorporated": "inc",
+    "limited": "ltd",
+    "private": "pvt",
+    "company": "co",
+    "compagnie": "cie",
+}
+
+# Address abbreviation mappings (road types, units, spatial landmark cues)
+ADDRESS_ABBREVIATIONS: dict[str, str] = {
+    # Road types (US / UK / India / France)
+    "rd": "road",
+    "st": "street",
+    "str": "street",
+    "ave": "avenue",
+    "av": "avenue",
+    "blvd": "boulevard",
+    "bld": "boulevard",
+    "bd": "boulevard",
+    "dr": "drive",
+    "ln": "lane",
+    "ct": "court",
+    "cir": "circle",
+    "hwy": "highway",
+    "pkwy": "parkway",
+    "way": "way",
+    "sq": "square",
+    "pl": "place",
+    "all": "allee",
+    "imp": "impasse",
+    "rte": "route",
+    "cres": "crescent",
+    "ter": "terrace",
+    "r": "rue",  # French street abbreviation
+    "rue": "rue",
+    # Unit / Sub-building designators
+    "apt": "apartment",
+    "ste": "suite",
+    "fl": "floor",
+    "flr": "floor",
+    "bldg": "building",
+    "bat": "batiment",
+    "dept": "department",
+    "rm": "room",
+    "no": "number",
+    # Landmark / Spatial relation indicators (kept intact for matching)
+    "nr": "near",
+    "opp": "opposite",
+    "adj": "adjacent",
+    "sec": "sector",
+    "ph": "phase",
 }
 
 
-def clean_text(text: str | None) -> str:
+# ==============================================================================
+# Core Normalization Functions
+# ==============================================================================
+
+def clean_text(text: str | None, preserve_hyphens: bool = True) -> str:
     """
-    Standardize raw text by normalizing unicode, lowercasing, and collapsing whitespace.
+    Standardize raw text:
+    1. Unicode NFKD decomposition (strips combining accents/diacritics for French/Spanish/etc.)
+    2. Lowercase transformation
+    3. Ampersand expansion (& -> 'and')
+    4. Punctuation stripping (optionally preserving internal hyphens like 'wal-mart', 'saint-denis')
+    5. Whitespace collapsing
 
     Args:
         text: Raw input string or None.
+        preserve_hyphens: Whether to preserve internal hyphens flanked by alphanumeric characters.
 
     Returns:
-        Cleaned, lowercased string with uniform single whitespace separation.
-        Returns empty string if input is None or whitespace-only.
+        Cleaned, normalized lowercase string with single whitespace separation.
     """
-    # TODO: Implement unicode normalization (NFKD), punctuation cleanup,
-    # and whitespace collapsing.
-    raise NotImplementedError("clean_text is not yet implemented.")
+    if not text:
+        return ""
+
+    text = str(text)
+
+    # 1. Unicode decomposition & diacritic stripping (e.g. é -> e, ç -> c)
+    text = "".join(
+        c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)
+    )
+
+    # 2. Lowercase
+    text = text.lower()
+
+    # 3. Collapse dotted acronyms BEFORE general punctuation removal so they don't
+    #    fragment into individual letters: S.A. -> sa, L.L.C. -> llc, S.A.R.L. -> sarl
+    text = re.sub(
+        r"\b[a-z](?:\.[a-z])+\.?",
+        lambda m: m.group(0).replace(".", ""),
+        text,
+    )
+
+    # 4. Expand ampersands
+    text = re.sub(r"&", " and ", text)
+
+    # 5. Strip punctuation
+    if preserve_hyphens:
+        # Keep alphanumeric, whitespace, and hyphens; replace everything else with space
+        text = re.sub(r"[^\w\s-]", " ", text)
+        # Strip hyphens that are not flanked on BOTH sides by alphanumeric characters
+        # (handles leading/trailing hyphens on the whole string and isolated hyphens)
+        text = re.sub(r"(?<![a-z0-9])-|-(?![a-z0-9])", " ", text)
+    else:
+        text = re.sub(r"[^\w\s]", " ", text)
+
+    # 6. Collapse multiple whitespaces
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def normalize_business_name(name: str | None, strip_legal_suffixes: bool = True) -> str:
+def normalize_name(name: str | None) -> str:
     """
-    Normalize business / entity company names.
-
-    Strips legal entity designations (e.g., 'LLC', 'Inc.', 'Corp'), removes non-alphanumeric
-    characters, and standardizes spacing.
+    Normalize business / entity name:
+    - Lowercase, strip punctuation except internal hyphens.
+    - Expand common business abbreviations both directions where safe:
+      corp <-> corporation, inc <-> incorporated, ltd <-> limited,
+      pvt <-> private, co <-> company, & <-> and, etc.
+    - Normalize whitespace.
 
     Args:
-        name: Raw business name string.
-        strip_legal_suffixes: Whether to remove common legal corporate suffixes. Defaults to True.
+        name: Raw entity name string.
 
     Returns:
-        Normalized business name string.
+        Normalized canonical name string.
     """
-    # TODO: Clean text, apply LEGAL_SUFFIXES_REGEX substitution if enabled,
-    # remove special characters while preserving informative alphanumeric tokens,
-    # and strip residual whitespace.
-    raise NotImplementedError("normalize_business_name is not yet implemented.")
+    cleaned = clean_text(name, preserve_hyphens=True)
+    if not cleaned:
+        return ""
+
+    tokens = cleaned.split()
+    normalized_tokens: list[str] = []
+
+    for token in tokens:
+        # If token contains an internal hyphen (e.g. high-tech), normalize parts if needed
+        if "-" in token:
+            parts = token.split("-")
+            expanded_parts = [NAME_ABBREVIATIONS.get(p, p) for p in parts]
+            normalized_tokens.append("-".join(expanded_parts))
+        else:
+            normalized_tokens.append(NAME_ABBREVIATIONS.get(token, token))
+
+    return " ".join(normalized_tokens)
+
+
+def extract_legal_suffix(name: str | None) -> tuple[str, str | None]:
+    """
+    Split off a trailing legal-entity suffix (corp, inc, llc, ltd, pvt ltd, gmbh, sarl, etc.)
+    if present, returning (core_name, suffix_or_None).
+
+    Keeps suffix extraction separate from normalized name since suffix presence/absence
+    is a valuable feature for pairwise matching rather than noise to discard.
+
+    Args:
+        name: Raw or partially normalized business entity name.
+
+    Returns:
+        tuple[str, str | None]: (core_name, suffix_or_None).
+        core_name has trailing punctuation/whitespace stripped.
+        suffix is canonicalized to lowercase without periods (e.g., 'pvt ltd', 'inc', 'llc').
+        If no suffix is found, returns (name.strip(), None).
+    """
+    if not name:
+        return ("", None)
+
+    raw_str = str(name).strip()
+    match = LEGAL_SUFFIX_PATTERN.search(raw_str)
+    if not match:
+        return (raw_str, None)
+
+    raw_suffix = match.group(1).strip()
+    core_name = raw_str[: match.start()].rstrip(" ,.-/")
+
+    # If removing suffix leaves an empty core name, treat entire name as core name
+    if not core_name:
+        return (raw_str, None)
+
+    # Standardize suffix (lowercase, remove internal dots, normalize spaces)
+    clean_sfx = re.sub(r"\.", "", raw_suffix).lower()
+    clean_sfx = re.sub(r"\s+", " ", clean_sfx).strip()
+    canonical_suffix = LEGAL_SUFFIX_CANONICAL.get(clean_sfx, clean_sfx)
+
+    return (core_name, canonical_suffix)
 
 
 def normalize_address(address: str | None) -> str:
     """
-    Normalize physical street addresses to canonical short abbreviations.
-
-    Replaces expanded street names (e.g. 'Street' -> 'st', 'Avenue' -> 'ave'),
-    standardizes secondary unit designators ('Suite 200' -> 'ste 200'), and removes punctuation.
-
-    Args:
-        address: Raw street address string.
-
-    Returns:
-        Canonical normalized street address.
-    """
-    # TODO: Clean text, replace common street suffix variants using STREET_SUFFIX_MAP,
-    # standardize unit/suite prefixes, and remove punctuation.
-    raise NotImplementedError("normalize_address is not yet implemented.")
-
-
-def normalize_postal_code(postal_code: str | None) -> str:
-    """
-    Normalize postal / ZIP codes to standard 5-digit or alphanumeric form.
+    Normalize physical street addresses without external geocoding:
+    - Lowercase, normalize common abbreviations (rd <-> road, st <-> street,
+      ave <-> avenue, apt <-> apartment).
+    - Landmark phrases ('near', 'opposite') and spatial indicators are kept as-is
+      to assist pairwise entity matching.
+    - Normalize whitespace and punctuation, preserving internal hyphens.
 
     Args:
-        postal_code: Raw postal code string.
+        address: Raw address string.
 
     Returns:
-        Sanitized postal code string (e.g. 5-digit US zip or cleaned alphanumeric code).
+        Cleaned, normalized address string.
     """
-    # TODO: Strip whitespace and non-alphanumeric characters, and format to 5-digit zip if US.
-    raise NotImplementedError("normalize_postal_code is not yet implemented.")
+    if not address:
+        return ""
+
+    # 1. Clean unicode, lowercase, expand ampersands, strip non-internal punctuation
+    cleaned = clean_text(address, preserve_hyphens=True)
+    if not cleaned:
+        return ""
+
+    # 2. Expand common road, unit, and landmark abbreviations
+    tokens = cleaned.split()
+    normalized_tokens: list[str] = []
+
+    for token in tokens:
+        if "-" in token:
+            parts = token.split("-")
+            expanded_parts = [ADDRESS_ABBREVIATIONS.get(p, p) for p in parts]
+            normalized_tokens.append("-".join(expanded_parts))
+        else:
+            normalized_tokens.append(ADDRESS_ABBREVIATIONS.get(token, token))
+
+    return " ".join(normalized_tokens)
 
 
-def normalize_phone_number(phone: str | None) -> str:
+def tokenize(s: str | None) -> list[str]:
     """
-    Normalize telephone numbers by stripping formatting characters and extracting digits.
+    Simple whitespace tokenizer on normalized strings, used for Jaccard and token-set features.
 
     Args:
-        phone: Raw phone string (e.g., '+1 (555) 123-4567').
+        s: Input normalized string.
 
     Returns:
-        Normalized digits-only string, or empty string if invalid.
+        List of non-empty string tokens.
     """
-    # TODO: Extract digits, handle country code prefix (+1), and validate digit length.
-    raise NotImplementedError("normalize_phone_number is not yet implemented.")
+    if not s:
+        return []
+    return s.strip().split()
 
+
+# Alias for backward compatibility
+normalize_business_name = normalize_name
+
+
+# ==============================================================================
+# DataFrame Batch Normalization
+# ==============================================================================
 
 def normalize_dataframe(
     df: pd.DataFrame,
-    name_cols: Sequence[str] = ("name", "business_name"),
-    address_cols: Sequence[str] = ("address", "street_address"),
-    postal_cols: Sequence[str] = ("zip", "postal_code", "zip_code"),
-    phone_cols: Sequence[str] = ("phone", "telephone", "phone_number"),
+    name_col: str = "business_name",
+    address_col: str = "business_address",
+    output_name_col: str = "norm_name",
+    output_address_col: str = "norm_address",
+    output_suffix_col: str = "legal_suffix",
 ) -> pd.DataFrame:
     """
-    Apply normalization routines across all matching columns of a pandas DataFrame.
+    Apply normalization routines across business entity records in a pandas DataFrame.
 
-    Creates new standardized columns prefixed with 'norm_' or overwrites in place
-    depending on configuration.
+    Adds:
+        - output_name_col: Normalized business name
+        - output_address_col: Normalized street address
+        - output_suffix_col: Extracted trailing legal entity suffix (or None)
 
     Args:
-        df: Input pandas DataFrame containing raw entity records.
-        name_cols: Column names to treat as entity names.
-        address_cols: Column names to treat as street addresses.
-        postal_cols: Column names to treat as postal/zip codes.
-        phone_cols: Column names to treat as phone numbers.
+        df: Input DataFrame containing entity records.
+        name_col: Column name containing business names.
+        address_col: Column name containing street addresses.
+        output_name_col: Destination column for normalized names.
+        output_address_col: Destination column for normalized addresses.
+        output_suffix_col: Destination column for extracted legal suffixes.
 
     Returns:
-        DataFrame with added normalized columns.
+        Enriched DataFrame with normalized columns.
     """
-    # TODO: Iterate through identified columns, invoke corresponding normalization
-    # functions, and return enriched DataFrame.
-    raise NotImplementedError("normalize_dataframe is not yet implemented.")
+    out = df.copy()
 
+    if name_col in out.columns:
+        out[output_name_col] = out[name_col].astype(str).map(normalize_name)
+        extracted = out[name_col].astype(str).map(extract_legal_suffix)
+        out[output_suffix_col] = [sfx for _, sfx in extracted]
+
+    if address_col in out.columns:
+        out[output_address_col] = out[address_col].astype(str).map(normalize_address)
+
+    return out
+
+
+# ==============================================================================
+# CLI Entrypoint
+# ==============================================================================
 
 def parse_args(args: Sequence[str] | None = None) -> argparse.Namespace:
     """
-    Parse command-line arguments for the normalization module.
-
-    Args:
-        args: Optional list of argument strings. Defaults to sys.argv[1:].
-
-    Returns:
-        Parsed argparse.Namespace.
+    Parse command-line arguments for normalize.py.
     """
     parser = argparse.ArgumentParser(
         description="Run text and address normalization on entity dataset splits.",
@@ -179,7 +438,7 @@ def parse_args(args: Sequence[str] | None = None) -> argparse.Namespace:
         "--input-path",
         type=Path,
         default=None,
-        help="Optional explicit path to input TSV/CSV file. If not set, resolves via --split.",
+        help="Optional explicit path to input TSV file. If not set, resolves via --split.",
     )
     parser.add_argument(
         "--output-path",
@@ -203,10 +462,31 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     input_dir = get_split_dir(args.split) if args.input_path is None else args.input_path
-    logger.info("Running normalization for split '%s' from %s", args.split, input_dir)
+    logger.info("Executing normalization on split '%s' from %s", args.split, input_dir)
 
-    # TODO: Load dataset TSVs from input_dir, run normalize_dataframe, and save output.
-    raise NotImplementedError("CLI execution for normalize.py is not yet implemented.")
+    # If input is a directory, normalize all source TSVs found
+    if input_dir.is_dir():
+        for source_tsv in sorted(input_dir.glob("*.tsv")):
+            logger.info("Normalizing file: %s", source_tsv.name)
+            df = pd.read_csv(source_tsv, sep="\t", dtype=str, keep_default_na=False)
+            norm_df = normalize_dataframe(df)
+            out_file = (
+                args.output_path
+                if args.output_path
+                else source_tsv.parent / f"normalized_{source_tsv.name}"
+            )
+            norm_df.to_csv(out_file, sep="\t", index=False)
+            logger.info("Saved normalized records to: %s", out_file)
+    elif input_dir.is_file():
+        df = pd.read_csv(input_dir, sep="\t", dtype=str, keep_default_na=False)
+        norm_df = normalize_dataframe(df)
+        out_file = (
+            args.output_path
+            if args.output_path
+            else input_dir.parent / f"normalized_{input_dir.name}"
+        )
+        norm_df.to_csv(out_file, sep="\t", index=False)
+        logger.info("Saved normalized records to: %s", out_file)
 
 
 if __name__ == "__main__":

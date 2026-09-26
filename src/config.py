@@ -8,7 +8,10 @@ random seeds, directory locations, filenames, and default hyperparameters.
 from pathlib import Path
 import os
 import random
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore
 
 # ==============================================================================
 # Global Reproducibility
@@ -25,7 +28,9 @@ def seed_everything(seed: int = RANDOM_SEED) -> None:
     """
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
-    np.random.seed(seed)
+    if np is not None:
+        np.random.seed(seed)
+
 
 
 # ==============================================================================
@@ -42,6 +47,10 @@ MODELS_DIR: Path = PROJECT_ROOT / "models"
 DATASET_DIR: Path = DATA_DIR / "dataset"
 TRAIN_DATA_DIR: Path = DATASET_DIR / "train"
 TEST_DATA_DIR: Path = DATASET_DIR / "test"
+
+# Standard aliases
+TRAIN_DIR: Path = TRAIN_DATA_DIR
+TEST_DIR: Path = TEST_DATA_DIR
 
 # Fallback flat split directories under data/
 FALLBACK_TRAIN_DATA_DIR: Path = DATA_DIR / "train"
